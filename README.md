@@ -1,2 +1,3 @@
 # Multi-Screen-Socket-Server
-Node socket server for Multi Screen Fitness Display
+
+Node socket server for synchronized playback in Multi Screen Fitness Display

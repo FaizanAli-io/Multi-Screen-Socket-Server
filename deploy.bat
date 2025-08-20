@@ -1,0 +1,3 @@
+@REM echo Deploying to server...
+ssh -i multi-screen.pem ubuntu@13.62.101.32
+@REM echo Deployment complete!
