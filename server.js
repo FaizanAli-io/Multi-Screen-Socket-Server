@@ -19,8 +19,8 @@ app.use(cors());
 app.use(json());
 
 // -------------------- State --------------------
-const connectedScreens = new Map(); // screenId → socket
 const connectedControlPanels = new Set(); // sockets
+const connectedScreens = new Map(); // screenId → Set<socket>
 
 // -------------------- Helpers --------------------
 function broadcastToControlPanels(event, data) {
@@ -29,12 +29,27 @@ function broadcastToControlPanels(event, data) {
   });
 }
 
+// New helper → send latest connected screens state
+function broadcastConnectedScreens() {
+  const screenData = Array.from(connectedScreens.entries()).map(([screenId, sockets]) => ({
+    screenId,
+    count: sockets.size
+  }));
+
+  broadcastToControlPanels("connected_screens_update", { screens: screenData });
+}
+
 function sendCommandToScreens(command, targetScreens, payload) {
   targetScreens.forEach((screenId) => {
-    const screenSocket = connectedScreens.get(screenId);
-    if (screenSocket) {
-      screenSocket.emit(command, payload);
-      console.log(`✅ ${command} sent to ${screenId}`);
+    const screenSockets = connectedScreens.get(screenId);
+    if (screenSockets && screenSockets.size > 0) {
+      let index = 1;
+      screenSockets.forEach((screenSocket) => {
+        screenSocket.emit(command, payload);
+        console.log(
+          `✅ ${command} sent to Screen ${screenId} (socket ${index++} of ${screenSockets.size})`
+        );
+      });
     } else {
       console.log(`❌ Screen ${screenId} not connected`);
     }
@@ -42,10 +57,15 @@ function sendCommandToScreens(command, targetScreens, payload) {
 }
 
 // -------------------- Routes --------------------
-app.get("/health", (req, res) => {
+app.get("/health", (_, res) => {
+  const screens = Array.from(connectedScreens.entries()).map(([screenId, sockets]) => ({
+    screenId,
+    instances: sockets.size
+  }));
+
   res.json({
     status: "ok",
-    connectedScreens: Array.from(connectedScreens.keys()),
+    connectedScreens: screens,
     controlPanels: connectedControlPanels.size
   });
 });
@@ -56,46 +76,66 @@ io.on("connection", (socket) => {
 
   // ---- Registration ----
   socket.on("register_screen", ({ screenId }) => {
-    console.log(`📺 Screen registered: ${screenId}`);
-    connectedScreens.set(screenId, socket);
+    console.log(`📺 Registering socket for Screen ${screenId}`);
 
-    socket.screenId = screenId;
     socket.clientType = "screen";
+    socket.screenId = screenId;
 
-    // Notify control panels
-    broadcastToControlPanels("screen_connected", { screenId });
+    // Get or create socket set for this screen
+    let screenSockets = connectedScreens.get(screenId);
+    if (!screenSockets) {
+      screenSockets = new Set();
+      connectedScreens.set(screenId, screenSockets);
+    }
+
+    // If already 3 instances, remove the oldest one
+    if (screenSockets.size >= 3) {
+      console.log(`⚠️ Maximum instances reached for ${screenId}. Removing oldest connection.`);
+      const oldestSocket = Array.from(screenSockets)[0];
+      screenSockets.delete(oldestSocket);
+      oldestSocket.disconnect(true);
+    }
+
+    // Add the new socket
+    screenSockets.add(socket);
+
+    // Send full updated state instead of just one-screen event
+    broadcastConnectedScreens();
 
     // Acknowledge registration
     socket.emit("registration_success", {
       screenId,
+      instances: screenSockets.size,
       connectedScreens: Array.from(connectedScreens.keys())
     });
   });
 
   socket.on("register_control_panel", () => {
     console.log(`🎮 Control panel registered: ${socket.id}`);
-    connectedControlPanels.add(socket);
     socket.clientType = "control_panel";
+    connectedControlPanels.add(socket);
 
-    // Send initial state
-    socket.emit("connected_screens_update", {
-      screens: Array.from(connectedScreens.keys())
-    });
+    // Send initial state immediately
+    broadcastConnectedScreens();
   });
 
   // ---- Sync Commands ----
   socket.on("sync_play", ({ targetScreens, timestamp }) => {
-    console.log(`▶️ Sync play for screens: ${targetScreens.join(", ")}`);
+    console.log(`▶️  Sync play for screens: ${targetScreens.join(", ")}`);
     sendCommandToScreens("play_command", targetScreens, { timestamp });
-
     socket.emit("sync_command_ack", { action: "play", targetScreens, timestamp });
   });
 
   socket.on("sync_pause", ({ targetScreens, timestamp }) => {
-    console.log(`⏸️ Sync pause for screens: ${targetScreens.join(", ")}`);
+    console.log(`⏸️  Sync pause for screens: ${targetScreens.join(", ")}`);
     sendCommandToScreens("pause_command", targetScreens, { timestamp });
-
     socket.emit("sync_command_ack", { action: "pause", targetScreens, timestamp });
+  });
+
+  socket.on("sync_stop", ({ targetScreens, timestamp }) => {
+    console.log(`⏹️  Sync stop for screens: ${targetScreens.join(", ")}`);
+    sendCommandToScreens("stop_command", targetScreens, { timestamp });
+    socket.emit("sync_command_ack", { action: "stop", targetScreens, timestamp });
   });
 
   // ---- Status Updates ----
@@ -109,9 +149,19 @@ io.on("connection", (socket) => {
     console.log(`❌ Client disconnected: ${socket.id}`);
 
     if (socket.clientType === "screen" && socket.screenId) {
-      console.log(`📺❌ Screen disconnected: ${socket.screenId}`);
-      connectedScreens.delete(socket.screenId);
-      broadcastToControlPanels("screen_disconnected", { screenId: socket.screenId });
+      const screenSockets = connectedScreens.get(socket.screenId);
+      if (screenSockets) {
+        screenSockets.delete(socket);
+        console.log(`📺 Instance of ${socket.screenId} disconnected (${screenSockets.size} left)`);
+
+        // If no more instances, remove screen entirely
+        if (screenSockets.size === 0) {
+          connectedScreens.delete(socket.screenId);
+        }
+
+        // Always update control panels after disconnect
+        broadcastConnectedScreens();
+      }
     }
 
     if (socket.clientType === "control_panel") {
